@@ -1,0 +1,9 @@
+build/
+*.o
+*.prx
+*.elf
+*.oelf
+*.pkg
+*.pklg
+a4f_bt_mac
+.DS_Store
