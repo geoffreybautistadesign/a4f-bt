@@ -3,8 +3,9 @@
 Goal: on a jailbroken PS4 Pro (GoldHEN, firmware 13.52), send game audio straight to AirPods
 through a USB Bluetooth dongle plugged into the console — **no phone, no computer**.
 
-**Status: the PS4 → dongle → AirPods chain works (test tone heard from inside a game).
-The game audio still has to be fed into it.**
+**Status: game audio plays in the AirPods in real time (tested in Rayman: 47 A2DP packets/s,
+no drops, no underruns, ~40 ms buffer). Some games block the USB library (RE4 Remake), and only
+one audio port is captured so far.**
 
 ---
 
@@ -18,7 +19,8 @@ The game audio still has to be fed into it.**
 | Dongle access from inside a PS4 game through `libSceUsbd`, **without jailbreaking the process** | ✅ (**right** USB port only) |
 | HCI commands, events and Bluetooth inquiry from the game (AirPods found) | ✅ |
 | BTstack ported to the PS4: GoldHEN plugin that pairs, stores the link key, reconnects on its own and plays a tone | ✅ heard in the AirPods |
-| Game audio in the AirPods | ❌ to do (see below) |
+| Game audio captured from `sceAudioOut` (import-table redirection, all formats converted to s16 stereo) | ✅ |
+| Game audio in the AirPods | ✅ Rayman (see the compatibility table) |
 
 ### Key test results (PS4 Pro, 13.52)
 
@@ -31,42 +33,41 @@ The game audio still has to be fed into it.**
   must be preferred at connection time. When the AirPods initiate the connection they sometimes
   pick 44.1 kHz; the buffer then resamples.
 - AirPods Bluetooth latency: about 150–200 ms, plus ~40 ms of buffering.
+- **`CLOCK_MONOTONIC` is wrong on the PS4**: the toolchain headers come from musl, where it is 1;
+  for the PS4 kernel (FreeBSD) clock 1 is `CLOCK_VIRTUAL`, the process CPU time. BTstack then ran
+  at the game's CPU pace (~1/3 of real time in Rayman): a third of the A2DP throughput, choppy
+  audio. The run loop now uses FreeBSD's monotonic clock (id 4).
+- Raising the plugin thread priority (`scePthreadSetprio`) coincided with RE4 Remake freezing at
+  launch; the plugin keeps the default priority.
+- The GoldHEN FTP server decrypts SELF/PRX files on download: a downloaded `.prx` is not a usable
+  backup.
 
 ---
 
+## Game compatibility
+
+| Game | Audio capture | `libSceUsbd` | AirPods | Notes |
+|---|---|---|---|---|
+| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | only the first MAIN port is captured |
+| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ `0x80020002` (ENOENT, game sandbox) | ❌ | |
+
+`debug.log` (`/data/GoldHEN/a4f_bt/`) has one line per second: audio ports opened, captured blocks,
+`usbd tries/step/error`, A2DP packets sent, dropped frames. Healthy numbers: `paquets` ~47/s,
+`jetees` not increasing.
+
 ## What is left to do
 
-**Feed the game audio into the plugin.** The Bluetooth core exposes:
+1. **Games whose sandbox hides `libSceUsbd`** (RE4 Remake: `sceKernelLoadStartModule` returns
+   `0x80020002`). Lead: load it through the system module loader instead of a file path.
+2. **Mix several audio ports**: games often open several `MAIN` ports (Rayman: two float stereo
+   ports plus an s16 port); the plugin only captures the first one, so some sounds may be missing.
+3. Test more games and fill in the table above.
 
-```c
-uint32_t a4f_bt_push_pcm(const int16_t *pcm, uint32_t frames);   // interleaved s16 stereo, 48 kHz
-void     a4f_bt_set_tone(bool on);                                // false = play the pushed PCM
-```
-
-`a4f_bt_push_pcm` can be called from any thread (lock-free buffer, single producer). In the
-plugin (`a4f_bt/plugin/source/main.c`) one needs to:
-
-1. get the audio blocks the game sends to `sceAudioOut`;
-2. convert them to s16 stereo 48 kHz (the Audio4Free project already has a converter for every
-   `sceAudioOut` format: mono/stereo/7.1, s16/float);
-3. push them with `a4f_bt_push_pcm()` and call `a4f_bt_set_tone(false)`.
-
-Things observed during testing:
-- a game often opens **several** `MAIN` ports (e.g. two 512-frame float stereo ports plus a
-  1024-frame s16 port): several ports may need to be mixed; the current buffer has a single input;
-- with the GoldHEN Plugins SDK `HOOK32` detours on `sceAudioOutOutput`, calling the original
-  (`HOOK_CONTINUE`) no longer blocked: the game called the function ~5 million times per second
-  (black screen, then crash CE-34878-0). The detour copies the function prologue without fixing
-  RIP-relative instructions (`Detour.c`).
-
-## What is blocking
-
-That part (capturing the game audio inside the PS4 process) has not been written: the assistant
-that developed the rest of the project stopped there. Everything else is done and tested; someone
-familiar with PS4 game audio can pick it up from `a4f_bt_push_pcm()`.
-
-No-code alternative: a USB Bluetooth audio transmitter that the PS4 sees as a headset
-(Creative BT-W3/BT-W4, Avantree DG80), or a transmitter on the PS4 Pro optical output.
+How the capture works: `sceAudioOutOpen`, `sceAudioOutClose`, `sceAudioOutOutput` and
+`sceAudioOutOutputs` are redirected in the import tables (GOT) of the game modules, so
+`libSceAudioOut` itself is untouched and the TV keeps playing. GoldHEN `HOOK32` detours were
+dropped: they copy the prologue without fixing RIP-relative instructions, and calling the original
+returned immediately (~5 million calls per second, black screen, crash CE-34878-0).
 
 ---
 

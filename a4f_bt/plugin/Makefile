@@ -16,12 +16,12 @@ include $(A4F_BT)/btstack_sources.mk
 
 CFLAGS := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c -O2 -std=gnu11 \
 	-D__FINAL__=1 -D__USE_PRINTF__ -Wall -Wno-unused-parameter \
-	-isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include -I$(GH_SDK)/include -I$(GH_COMMON) $(BTSTACK_INC)
+	-isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include -I$(GH_SDK)/include -I$(GH_COMMON) -I$(A4F_BT)/plugin/source $(BTSTACK_INC)
 LDFLAGS := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x -e _init --eh-frame-hdr \
-	-L$(TOOLCHAIN)/lib -L$(GH_SDK) -lSceLibcInternal -lGoldHEN_Hook -lkernel -lSceSysmodule
+	-L$(TOOLCHAIN)/lib -L$(GH_SDK) -lSceLibcInternal -lGoldHEN_Hook -lkernel -lSceSysmodule -lSceAudioOut
 
 OBJS := $(patsubst %.c,$(OUT)/bt/%.o,$(BTSTACK_SRC)) $(patsubst %.c,$(OUT)/a4f/%.o,$(A4F_BT_SRC)) \
-	$(OUT)/a4f/plugin/source/main.o $(OUT)/plugin_common.o
+	$(OUT)/a4f/plugin/source/main.o $(OUT)/a4f/plugin/source/convert.o $(OUT)/plugin_common.o
 
 a4f_bt.prx: $(OBJS)
 	$(LD) $(GH_SDK)/build/crtprx.o $(OBJS) -o $(OUT)/a4f_bt.elf $(LDFLAGS)

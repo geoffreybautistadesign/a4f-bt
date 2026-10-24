@@ -92,6 +92,7 @@ static btstack_audio_generator_sine_t sine;
 static a4f_ring_t pcm_ring;
 
 static volatile uint32_t pulls;   // appels à produce_audio (journal de debug)
+static volatile uint32_t packets; // paquets A2DP envoyés (journal de debug)
 
 static void produce_audio(int16_t *pcm, int num_frames){
     pulls++;
@@ -109,6 +110,7 @@ static void send_media_packet(void){
     a2dp_source_stream_send_media_payload_rtp(media.a2dp_cid, media.local_seid, 0, media.rtp_timestamp,
                                               media.sbc_storage, media.sbc_storage_count + 1);
     media.rtp_timestamp += num_frames * sbc_encoder->num_audio_frames(&sbc_encoder_state);
+    packets++;
     media.sbc_storage_count = 0;
     media.sbc_ready_to_send = 0;
 }
@@ -126,6 +128,10 @@ static void fill_sbc_buffer(void){
     }
 }
 
+#define MAX_BACKLOG_FRAMES (48000 / 5)   // 200 ms
+
+static void try_send(void);
+
 static void audio_timeout_handler(btstack_timer_source_t *timer){
     btstack_run_loop_set_timer(timer, AUDIO_TIMEOUT_MS);
     btstack_run_loop_add_timer(timer);
@@ -139,7 +145,18 @@ static void audio_timeout_handler(btstack_timer_source_t *timer){
     }
     media.time_audio_data_sent = now;
     media.samples_ready += n;
+    // après un long blocage du thread, on ne rattrape pas plus que ça (le tampon PCM
+    // jette déjà le surplus)
+    if (media.samples_ready > MAX_BACKLOG_FRAMES) media.samples_ready = MAX_BACKLOG_FRAMES;
 
+    try_send();
+}
+
+// Prépare le paquet suivant et demande à l'envoyer s'il est plein. Appelée par le timer
+// et juste après chaque envoi : sur PS4 le thread est réveillé bien moins souvent que
+// toutes les 10 ms (le jeu prend le CPU), donc un seul paquet par réveil ne suffisait
+// pas (~16 paquets/s, un tiers du débit) ; on enchaîne les paquets tant qu'il y a du retard.
+static void try_send(void){
     if (media.sbc_ready_to_send) return;
     fill_sbc_buffer();
     if ((media.sbc_storage_count + sbc_encoder->sbc_buffer_length(&sbc_encoder_state)) > media.max_media_payload_size){
@@ -332,6 +349,7 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
 
         case A2DP_SUBEVENT_STREAMING_CAN_SEND_MEDIA_PACKET_NOW:
             send_media_packet();
+            try_send();
             break;
 
         case A2DP_SUBEVENT_STREAM_SUSPENDED:
@@ -430,8 +448,8 @@ uint32_t a4f_bt_push_pcm(const int16_t *pcm, uint32_t frames){
 }
 
 void a4f_bt_debug(char *buf, int len){
-    snprintf(buf, len, "etat %d, %d Hz, tonalite %d, lectures %u, tampon %u ms, sous-alim %u, jetees %u, debordements %u, statut '%s'",
-             (int) state, sample_rate, (int) tone_on, (unsigned) pulls, a4f_ring_fill(&pcm_ring) / 48,
+    snprintf(buf, len, "etat %d, %d Hz, tonalite %d, paquets %u, lectures %u, tampon %u ms, sous-alim %u, jetees %u, debordements %u, statut '%s'",
+             (int) state, sample_rate, (int) tone_on, (unsigned) packets, (unsigned) pulls, a4f_ring_fill(&pcm_ring) / 48,
              (unsigned) pcm_ring.underruns, (unsigned) pcm_ring.dropped,
              (unsigned) __atomic_load_n(&pcm_ring.overflows, __ATOMIC_RELAXED), last_status);
 }

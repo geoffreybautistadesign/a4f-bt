@@ -18,9 +18,19 @@ static pthread_cond_t  rl_cond  = PTHREAD_COND_INITIALIZER;
 static bool rl_triggered;
 static bool rl_exit_requested;
 
+// PS4 : les en-têtes du toolchain viennent de musl, où CLOCK_MONOTONIC vaut 1. Pour le
+// noyau PS4 (FreeBSD), 1 est CLOCK_VIRTUAL, le temps CPU du processus : BTstack comptait
+// alors le temps au rythme du jeu (~1/3 du temps réel dans Rayman), d'où un tiers du débit
+// A2DP et des timers irréguliers. Le monotone FreeBSD est l'horloge 4.
+#ifdef __FreeBSD__
+#define A4F_CLOCK_MONOTONIC 4
+#else
+#define A4F_CLOCK_MONOTONIC CLOCK_MONOTONIC
+#endif
+
 uint32_t btstack_run_loop_a4f_time_ms(void){
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(A4F_CLOCK_MONOTONIC, &ts) != 0) clock_gettime(CLOCK_REALTIME, &ts);
     return (uint32_t) (ts.tv_sec * 1000u + ts.tv_nsec / 1000000);
 }
 
