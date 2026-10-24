@@ -93,6 +93,13 @@ static a4f_ring_t pcm_ring;
 
 static volatile uint32_t pulls;   // appels à produce_audio (journal de debug)
 static volatile uint32_t packets; // paquets A2DP envoyés (journal de debug)
+static volatile bool streaming;    // flux A2DP démarré : le casque joue ce qu'on envoie
+
+// Gain appliqué à tout ce qui part vers le casque, en Q15 (32768 = son d'origine).
+// Démarre bas : le son du jeu à fond dans des AirPods fait mal aux oreilles.
+#define A4F_DEFAULT_VOLUME 30
+static volatile int32_t gain_q15 = A4F_DEFAULT_VOLUME * A4F_DEFAULT_VOLUME * 32768 / 10000;
+static volatile int volume_percent = A4F_DEFAULT_VOLUME;
 
 static void produce_audio(int16_t *pcm, int num_frames){
     pulls++;
@@ -101,6 +108,9 @@ static void produce_audio(int16_t *pcm, int num_frames){
     } else {
         a4f_ring_pull(&pcm_ring, pcm, num_frames, sample_rate);
     }
+    int32_t g = gain_q15;
+    if (g == 32768) return;
+    for (int i = 0; i < num_frames * 2; i++) pcm[i] = (int16_t) ((pcm[i] * g) >> 15);
 }
 
 static void send_media_packet(void){
@@ -166,6 +176,7 @@ static void try_send(void){
 }
 
 static void audio_start(void){
+    streaming = true;
     btstack_audio_generator_sine_init(&sine, sample_rate, 2, 441);
     media.max_media_payload_size = btstack_min(a2dp_max_media_payload_size(media.a2dp_cid, media.local_seid), SBC_STORAGE_SIZE);
     media.sbc_storage_count = 0;
@@ -180,6 +191,7 @@ static void audio_start(void){
 }
 
 static void audio_stop(void){
+    streaming = false;
     btstack_run_loop_remove_timer(&media.audio_timer);
     media.sbc_storage_count = 0;
     media.sbc_ready_to_send = 0;
@@ -443,13 +455,29 @@ void a4f_bt_set_tone(bool on){
     tone_on = on;
 }
 
+// Courbe quadratique, plus proche de l'oreille qu'un gain linéaire : 50 % ≈ -12 dB, 30 % ≈ -21 dB.
+void a4f_bt_set_volume(int percent){
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    volume_percent = percent;
+    gain_q15 = (int32_t) (percent * percent * 32768 / 10000);
+}
+
+bool a4f_bt_is_streaming(void){
+    return streaming;
+}
+
+int a4f_bt_get_volume(void){
+    return volume_percent;
+}
+
 uint32_t a4f_bt_push_pcm(const int16_t *pcm, uint32_t frames){
     return a4f_ring_push(&pcm_ring, pcm, frames);
 }
 
 void a4f_bt_debug(char *buf, int len){
-    snprintf(buf, len, "etat %d, %d Hz, tonalite %d, paquets %u, lectures %u, tampon %u ms, sous-alim %u, jetees %u, debordements %u, statut '%s'",
-             (int) state, sample_rate, (int) tone_on, (unsigned) packets, (unsigned) pulls, a4f_ring_fill(&pcm_ring) / 48,
+    snprintf(buf, len, "etat %d, %d Hz, volume %d, tonalite %d, paquets %u, lectures %u, tampon %u ms, sous-alim %u, jetees %u, debordements %u, statut '%s'",
+             (int) state, sample_rate, volume_percent, (int) tone_on, (unsigned) packets, (unsigned) pulls, a4f_ring_fill(&pcm_ring) / 48,
              (unsigned) pcm_ring.underruns, (unsigned) pcm_ring.dropped,
              (unsigned) __atomic_load_n(&pcm_ring.overflows, __ATOMIC_RELAXED), last_status);
 }

@@ -24,6 +24,11 @@ void a4f_bt_stop(void);
 
 // Son envoyé : tonalité de test, ou PCM s16 stéréo 48 kHz poussé par a4f_bt_push_pcm.
 void     a4f_bt_set_tone(bool on);
+// Volume envoyé au casque, 0 à 100 (30 par défaut). Appelable depuis n'importe quel thread.
+void     a4f_bt_set_volume(int percent);
+int      a4f_bt_get_volume(void);
+// Vrai quand le casque reçoit le son (flux A2DP démarré).
+bool     a4f_bt_is_streaming(void);
 uint32_t a4f_bt_push_pcm(const int16_t *pcm, uint32_t frames);   // appelable depuis n'importe quel thread
 
 // Une ligne d'état pour un journal de débogage (appelable depuis n'importe quel thread).

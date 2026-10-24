@@ -21,6 +21,8 @@ attr_public u32 g_pluginVersion = 0x00000300; // 3.00
 #define DUMP_PATH GOLDHEN_PATH "/a4f_bt/hci.pklg"
 #define DEBUG_PATH GOLDHEN_PATH "/a4f_bt/debug.log"
 #define TONE_FLAG_PATH GOLDHEN_PATH "/a4f_bt/tone"
+#define VOLUME_PATH GOLDHEN_PATH "/a4f_bt/volume"   // volume AirPods 0-100, relu chaque seconde
+#define TV_PATH GOLDHEN_PATH "/a4f_bt/tv"           // 0 = TV muette pendant que les AirPods jouent, 1 = son aussi sur la TV
 
 #define SCE_USBD_ERROR_TIMEOUT 0x80240007   // = LIBUSB_ERROR_TIMEOUT
 
@@ -49,10 +51,32 @@ static struct {
 // étape 1 = chargement du module, 2 = symbole introuvable (g_usbd_err = n° du symbole), 3 = sceUsbdInit.
 static volatile s32 g_usbd_step, g_usbd_err, g_usbd_tries;
 
-static int load_usbd(void) {
-    g_usbd_tries++;
+// Certains jeux (RE4 Remake, inFamous Second Son) ne voient pas libSceUsbd depuis leur bac à
+// sable (0x80020002, fichier introuvable). Comme la sonde a4f_bt_probe, on sort alors le
+// processus du bac à sable avec sys_sdk_jailbreak(), on charge le module, puis on y revient
+// tout de suite (sys_sdk_unjailbreak) : rester dehors change la racine des fichiers de tout le
+// processus, le jeu ne trouvait plus ses données (/app0) et restait sur un écran noir
+// (inFamous Second Son, v6). Le module reste chargé une fois revenu dans le bac à sable.
+static struct jailbreak_backup g_jb;
+static volatile s32 g_jailbroken;   // 0 = non tenté, 1 = module chargé hors du bac à sable puis retour, -1 = refusé
+
+static int32_t load_usbd_module(void) {
     int32_t h = (int32_t) sceKernelLoadStartModule("libSceUsbd.sprx", 0, NULL, 0, NULL, NULL);
     if (h < 0) h = (int32_t) sceKernelLoadStartModule("/system/common/lib/libSceUsbd.sprx", 0, NULL, 0, NULL, NULL);
+    return h;
+}
+
+static int load_usbd(void) {
+    g_usbd_tries++;
+    int32_t h = load_usbd_module();
+    if (h < 0 && g_jailbroken == 0) {
+        g_jailbroken = sys_sdk_jailbreak(&g_jb) == 0 ? 1 : -1;
+        final_printf("libSceUsbd: chargement 0x%08x, sys_sdk_jailbreak -> %d\n", (u32) h, g_jailbroken);
+        if (g_jailbroken == 1) {
+            h = load_usbd_module();
+            sys_sdk_unjailbreak(&g_jb);
+        }
+    }
     if (h < 0) {
         final_printf("libSceUsbd: chargement 0x%08x\n", (u32) h);
         g_usbd_step = 1; g_usbd_err = h;
@@ -188,12 +212,20 @@ static int16_t g_pcm[MAX_GRAIN * 2];
 static volatile u32 g_n_open, g_n_output, g_n_outputs, g_n_captured;
 static volatile s32 g_open_log[8][5];   // type, len, freq, fmt, handle des premiers sceAudioOutOpen
 
-static void capture(s32 handle, const void *ptr) {
-    if (handle != g_port || !ptr) return;
+// TV : par défaut on envoie du silence au vrai sceAudioOut pour le port capturé, mais
+// seulement pendant que les AirPods jouent (si le Bluetooth décroche, la TV reprend).
+// Les autres ports (haut-parleur de la manette, ports non capturés) restent intacts.
+static volatile s32 g_tv_on;                        // fichier TV_PATH, relu chaque seconde
+static const u8 g_silence[MAX_GRAIN * 8 * 4];       // un bloc 7.1 float de la taille maximale
+
+// Copie le bloc vers le Bluetooth ; renvoie le pointeur à passer au vrai sceAudioOut.
+static const void *capture(s32 handle, const void *ptr) {
+    if (handle != g_port || !ptr) return ptr;
     if (a4f_to_s16_stereo(ptr, g_port_fmt, g_port_grain, g_pcm) == 0) {
         a4f_bt_push_pcm(g_pcm, g_port_grain);
         g_n_captured++;
     }
+    return (!g_tv_on && a4f_bt_is_streaming()) ? (const void *) g_silence : ptr;
 }
 
 s32 sceAudioOutOpen_hook(s32 userId, s32 type, s32 index, u32 len, u32 freq, u32 param) {
@@ -222,14 +254,22 @@ s32 sceAudioOutClose_hook(s32 handle) {
 
 s32 sceAudioOutOutput_hook(s32 handle, const void *ptr) {
     g_n_output++;
-    capture(handle, ptr);
-    return sceAudioOutOutput(handle, ptr);
+    return sceAudioOutOutput(handle, capture(handle, ptr));
 }
 
 s32 sceAudioOutOutputs_hook(AudioOutOutputParam *param, u32 num) {
     g_n_outputs++;
-    for (u32 i = 0; param && i < num; i++) capture(param[i].handle, param[i].ptr);
-    return sceAudioOutOutputs(param, num);
+    // copie de la liste du jeu pour remplacer notre port par du silence sans toucher la sienne
+    AudioOutOutputParam p[16];
+    if (!param || num > 16) {
+        for (u32 i = 0; param && i < num; i++) capture(param[i].handle, param[i].ptr);
+        return sceAudioOutOutputs(param, num);
+    }
+    for (u32 i = 0; i < num; i++) {
+        p[i].handle = param[i].handle;
+        p[i].ptr = capture(param[i].handle, param[i].ptr);
+    }
+    return sceAudioOutOutputs(p, num);
 }
 
 // ---- redirection des imports
@@ -295,6 +335,60 @@ static void on_status(const char *msg) {
 }
 
 // Journal de debug : une ligne par seconde, fichier refermé à chaque fois (survit à un plantage).
+// Lit un entier (premier nombre du fichier) ; -1 si le fichier manque ou ne contient pas de
+// nombre. Pas de fscanf : avec les en-têtes musl et la libc PS4, le volume
+// changé par FTP pendant le jeu restait à l'ancienne valeur (v7).
+static volatile s32 g_last_read = -2;   // dernière valeur lue dans VOLUME_PATH, pour le journal
+
+static int read_int_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    char buf[16];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    int v = -1;
+    for (size_t i = 0; i < n; i++) {
+        if (buf[i] >= '0' && buf[i] <= '9') v = (v < 0 ? 0 : v * 10) + (buf[i] - '0');
+        else if (v >= 0) break;
+    }
+    return v;
+}
+
+// Même principe pour TV_PATH (0 ou 1, 0 par défaut).
+static void read_tv(void) {
+    FILE *f = fopen(TV_PATH, "r");
+    if (!f) {
+        f = fopen(TV_PATH, "w");
+        if (f) {
+            fprintf(f, "%d\n", (int) g_tv_on);
+            fclose(f);
+        }
+        return;
+    }
+    fclose(f);
+    int v = read_int_file(TV_PATH);
+    if (v >= 0) g_tv_on = v != 0;
+}
+
+// Lit le volume dans VOLUME_PATH (un nombre de 0 à 100) ; crée le fichier s'il manque,
+// pour qu'on le trouve par FTP. Modifiable pendant le jeu.
+static void read_volume(void) {
+    FILE *f = fopen(VOLUME_PATH, "r");
+    if (!f) {
+        sceKernelMkdir(DATA_DIR, 0777);
+        f = fopen(VOLUME_PATH, "w");
+        if (f) {
+            fprintf(f, "%d\n", a4f_bt_get_volume());
+            fclose(f);
+        }
+        return;
+    }
+    fclose(f);
+    int v = read_int_file(VOLUME_PATH);
+    g_last_read = v;
+    if (v >= 0 && v != a4f_bt_get_volume()) a4f_bt_set_volume(v);
+}
+
 static void *debug_thread(void *arg) {
     (void) arg;
     FILE *f = fopen(DEBUG_PATH, "w");
@@ -303,6 +397,8 @@ static void *debug_thread(void *arg) {
     for (u32 t = 0;; t++) {
         // modules ou imports résolus après le démarrage : on repasse de temps en temps
         if (t < 30 || t % 10 == 0) patch_imports();
+        read_volume();
+        read_tv();
         char bt[256];
         a4f_bt_debug(bt, sizeof(bt));
         f = fopen(DEBUG_PATH, "a");
@@ -311,8 +407,8 @@ static void *debug_thread(void *arg) {
                 volatile s32 *e = g_open_log[logged_opens++];
                 fprintf(f, "sceAudioOutOpen type %d len %d freq %d fmt %d -> 0x%08x\n", e[0], e[1], e[2], e[3], (u32) e[4]);
             }
-            fprintf(f, "%3us open %u output %u outputs %u captures %u port 0x%08x usbd %d/%d/0x%x | imports %u/%u/%u/%u [%s] | %s\n",
-                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, (u32) g_port, g_usbd_tries, g_usbd_step, (u32) g_usbd_err,
+            fprintf(f, "%3us open %u output %u outputs %u captures %u port 0x%08x usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
+                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, (u32) g_port, g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
                     g_patched[0], g_patched[1], g_patched[2], g_patched[3], g_patched_modules, bt);
             fclose(f);
         }
@@ -327,7 +423,7 @@ static void *bt_thread(void *arg) {
     // quelques essais : l'échec vu après un redémarrage de la console est peut-être passager
     while (load_usbd() < 0) {
         if (g_usbd_tries >= 10) {
-            Notify(TEX_ICON_SYSTEM, "A4F BT\nlibSceUsbd indisponible\netape %d, 0x%08x", g_usbd_step, (u32) g_usbd_err);
+            Notify(TEX_ICON_SYSTEM, "A4F BT\nlibSceUsbd indisponible\netape %d, 0x%08x, jb %d", g_usbd_step, (u32) g_usbd_err, g_jailbroken);
             return NULL;
         }
         sceKernelSleep(2);

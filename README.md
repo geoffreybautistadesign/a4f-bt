@@ -3,9 +3,9 @@
 Goal: on a jailbroken PS4 Pro (GoldHEN, firmware 13.52), send game audio straight to AirPods
 through a USB Bluetooth dongle plugged into the console — **no phone, no computer**.
 
-**Status: game audio plays in the AirPods in real time (tested in Rayman: 47 A2DP packets/s,
-no drops, no underruns, ~40 ms buffer). Some games block the USB library (RE4 Remake), and only
-one audio port is captured so far.**
+**Status: game audio plays in the AirPods in real time (Rayman, inFamous Second Son: ~48 A2DP
+packets/s, no drops, no underruns, ~40 ms buffer), with an adjustable volume and the TV muted
+while the AirPods play. Only one audio port is captured so far.**
 
 ---
 
@@ -41,6 +41,11 @@ one audio port is captured so far.**
   launch; the plugin keeps the default priority.
 - The GoldHEN FTP server decrypts SELF/PRX files on download: a downloaded `.prx` is not a usable
   backup.
+- Some games' sandbox hides `libSceUsbd` (`sceKernelLoadStartModule` → `0x80020002`, ENOENT:
+  RE4 Remake, inFamous Second Son). The plugin then leaves the sandbox (`sys_sdk_jailbreak`) just
+  long enough to load the module and goes back (`sys_sdk_unjailbreak`): staying outside changes the
+  process root, the game no longer finds `/app0` and stays on a black screen.
+- `fscanf` did not read the settings files (musl headers + PS4 libc); they are parsed by hand.
 
 ---
 
@@ -48,20 +53,32 @@ one audio port is captured so far.**
 
 | Game | Audio capture | `libSceUsbd` | AirPods | Notes |
 |---|---|---|---|---|
-| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | only the first MAIN port is captured |
-| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ `0x80020002` (ENOENT, game sandbox) | ❌ | |
+| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | only the first MAIN port is captured; the others stay on the TV |
+| inFamous Second Son | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ✅ after leaving the sandbox | ✅ complete audio, TV muted | |
+| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ before v6 (`0x80020002`) | ? | to retest with the sandbox fallback |
 
 `debug.log` (`/data/GoldHEN/a4f_bt/`) has one line per second: audio ports opened, captured blocks,
 `usbd tries/step/error`, A2DP packets sent, dropped frames. Healthy numbers: `paquets` ~47/s,
 `jetees` not increasing.
 
+## Settings
+
+Plain text files in `/data/GoldHEN/a4f_bt/` (created on first launch, editable over FTP, re-read
+every second while the game runs):
+
+| File | Default | Meaning |
+|---|---|---|
+| `volume` | `30` | AirPods volume, 0–100 (quadratic curve: 50 ≈ −12 dB, 30 ≈ −21 dB) |
+| `tv` | `0` | `0` = TV muted while the AirPods play (it comes back if Bluetooth drops), `1` = sound on both |
+| `tone` | absent | if present: test tone instead of the game audio |
+
 ## What is left to do
 
-1. **Games whose sandbox hides `libSceUsbd`** (RE4 Remake: `sceKernelLoadStartModule` returns
-   `0x80020002`). Lead: load it through the system module loader instead of a file path.
-2. **Mix several audio ports**: games often open several `MAIN` ports (Rayman: two float stereo
+1. **Mix several audio ports**: games often open several `MAIN` ports (Rayman: two float stereo
    ports plus an s16 port); the plugin only captures the first one, so some sounds may be missing.
-3. Test more games and fill in the table above.
+2. Test more games and fill in the table above.
+3. Volume control from the controller or from the AirPods (AVRCP absolute volume), instead of the
+   `volume` file.
 
 How the capture works: `sceAudioOutOpen`, `sceAudioOutClose`, `sceAudioOutOutput` and
 `sceAudioOutOutputs` are redirected in the import tables (GOT) of the game modules, so
