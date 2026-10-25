@@ -4,9 +4,10 @@ Goal: on a jailbroken PS4 Pro (GoldHEN, firmware 13.52), send game audio straigh
 through a USB Bluetooth dongle plugged into the console — **no phone, no computer**.
 
 **Status: game audio plays in the AirPods in real time (Rayman, inFamous Second Son, Ratchet &
-Clank, Shadow of the Colossus: ~48 A2DP packets/s, ~40 ms buffer), with an adjustable volume and
-the TV muted while the AirPods play. All MAIN audio ports are mixed (v8). Open issue: the sound
-in the AirPods sometimes stops while the plugin keeps sending (see below).**
+Clank, Shadow of the Colossus, Assassin's Creed Odyssey, Resident Evil 4 Remake: ~48 A2DP
+packets/s, ~40 ms buffer), with an adjustable volume and the TV muted while the AirPods play. All
+MAIN audio ports are mixed (v8), including the Audio3d output port used by RE4 (v9). Open issue:
+the sound in the AirPods sometimes stops on the radio side (see below).**
 
 ---
 
@@ -73,7 +74,8 @@ in the AirPods sometimes stops while the plugin keeps sending (see below).**
 | inFamous Second Son | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ✅ after leaving the sandbox | ✅ complete audio, TV muted | |
 | Ratchet & Clank | ✅ 1 MAIN 7.1 float port + BGM port | ✅ | ✅ complete audio (menu and game) | the BGM port (system background music) is not captured |
 | Shadow of the Colossus | ✅ 2 MAIN 7.1 float ports + BGM + pad speaker | ✅ after leaving the sandbox | ✅ with v8 | the game switches ports at a cutscene: v7 lost the sound there |
-| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ before v6 (`0x80020002`) | ❌ | froze at launch twice with the plugin: keep the plugin out of this game |
+| Assassin's Creed Odyssey | ✅ 2 MAIN ports (8ch s16, 7.1 float 2048 frames) | ✅ after leaving the sandbox | ✅ | a few short underruns: its 2048-frame blocks are longer than the 40 ms prefill |
+| Resident Evil 4 (remake) | ✅ silent MAIN port + **Audio3d output port** (7.1 float, 512 frames) | ✅ after leaving the sandbox | ✅ with v9c, TV muted, all sounds heard | the real mix goes through `sceAudio3dAudioOutOutput`; froze at launch twice with old builds (v4, v7b), never since v8e |
 
 `debug.log` (`/data/GoldHEN/a4f_bt/`) has one line per second: audio ports opened, captured blocks,
 captured ports with their peak level of the last second (`ports [7M:12 6:0]`: port `…07` is the
@@ -121,7 +123,18 @@ every second while the game runs):
 
 How the capture works: `sceAudioOutOpen`, `sceAudioOutClose`, `sceAudioOutOutput` and
 `sceAudioOutOutputs` are redirected in the import tables (GOT) of the game modules, so
-`libSceAudioOut` itself is untouched and the TV keeps playing. GoldHEN `HOOK32` detours were
+`libSceAudioOut` itself is untouched and the TV keeps playing.
+
+Audio3d (v9): some games send their mix through `libSceAudio3d` instead. RE4 Remake opens one
+silent `sceAudioOut` port and plays everything through `sceAudio3dAudioOutOpen` /
+`sceAudio3dAudioOutOutput` (the 3D objects and `sceAudio3dBedWrite` are not used). The plugin
+redirects those imports too, without linking against `libSceAudio3d`: it finds the module the game
+already loaded by querying module handles one by one with `sceKernelGetModuleInfo` (the module
+list only shows the game's own modules), then gets the function addresses with `sceKernelDlsym`.
+`libSceAudio3d` is loaded a few seconds after the game starts, so the plugin looks for it every
+100 ms for 15 s. A port is only captured if its opening was seen (known format): the format is
+never guessed, a wrong one would turn into loud noise. Imports were identified by downloading
+the game's decrypted `eboot.bin` over the GoldHEN FTP server and matching NIDs. GoldHEN `HOOK32` detours were
 dropped: they copy the prologue without fixing RIP-relative instructions, and calling the original
 returned immediately (~5 million calls per second, black screen, crash CE-34878-0).
 

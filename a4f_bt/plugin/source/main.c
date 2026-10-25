@@ -13,14 +13,17 @@
 #include "a4f_convert.h"
 #include "a4f_title.h"
 
+#include <time.h>
+
 attr_public const char *g_pluginName = "a4f_bt";
 attr_public const char *g_pluginDesc = "Son du jeu vers des AirPods par un dongle Bluetooth USB";
 attr_public const char *g_pluginAuth = "geoffrey";
-attr_public u32 g_pluginVersion = 0x00000805; // 8.05 (diagnostic param.sfo, délai de garde 12 s)
+attr_public u32 g_pluginVersion = 0x00000904; // 9.04 (v9c : capture du port audio 3D de RE4)
 
 #define DATA_DIR  GOLDHEN_PATH "/a4f_bt/"
 #define DUMP_PATH GOLDHEN_PATH "/a4f_bt/hci.pklg"
 #define DEBUG_PATH GOLDHEN_PATH "/a4f_bt/debug.log"
+#define DEBUG_PREV_PATH GOLDHEN_PATH "/a4f_bt/debug_prev.log"   // journal du lancement précédent
 #define TONE_FLAG_PATH GOLDHEN_PATH "/a4f_bt/tone"
 #define VOLUME_PATH GOLDHEN_PATH "/a4f_bt/volume"   // volume AirPods 0-100, relu chaque seconde
 #define TV_PATH GOLDHEN_PATH "/a4f_bt/tv"           // 0 = TV muette pendant que les AirPods jouent, 1 = son aussi sur la TV
@@ -321,6 +324,30 @@ static const void *capture(s32 handle, const void *ptr) {
     return (!g_tv_on && a4f_bt_is_streaming()) ? (const void *) g_silence : ptr;
 }
 
+// Ajoute un port aux ports capturés (sceAudioOutOpen, ou sceAudio3dAudioOutOpen pour RE4).
+static void register_port(s32 handle, s32 type, u32 len, u32 freq, u32 fmt) {
+    if (handle < 0 || type != SCE_AUDIO_OUT_PORT_TYPE_MAIN || freq != 48000 || len > MAX_GRAIN ||
+        a4f_channels(fmt) == 0 || find_port(handle) >= 0)
+        return;
+    int i = find_port(-1);
+    if (i < 0) return;
+    port_t *pt = &g_ports[i];
+    pt->grain = len;
+    pt->fmt = fmt;
+    pt->wr = pt->rd = 0;
+    pt->peak = 0;
+    __atomic_store_n(&pt->handle, handle, __ATOMIC_RELEASE);
+    final_printf("port capture %d : 0x%08x (%u trames, format %u)\n", i, handle, len, fmt);
+}
+
+static void unregister_port(s32 handle) {
+    int i = find_port(handle);
+    if (i >= 0) {
+        if (g_master == i) g_master = -1;
+        g_ports[i].handle = -1;
+    }
+}
+
 s32 sceAudioOutOpen_hook(s32 userId, s32 type, s32 index, u32 len, u32 freq, u32 param) {
     s32 handle = sceAudioOutOpen(userId, type, index, len, freq, param);
     u32 fmt = param & 0xFF;
@@ -330,28 +357,12 @@ s32 sceAudioOutOpen_hook(s32 userId, s32 type, s32 index, u32 len, u32 freq, u32
         e[0] = type; e[1] = (s32) len; e[2] = (s32) freq; e[3] = (s32) fmt; e[4] = handle;
     }
     g_n_open++;
-    if (handle >= 0 && type == SCE_AUDIO_OUT_PORT_TYPE_MAIN && freq == 48000 &&
-        len <= MAX_GRAIN && a4f_channels(fmt) != 0 && find_port(handle) < 0) {
-        int i = find_port(-1);
-        if (i >= 0) {
-            port_t *pt = &g_ports[i];
-            pt->grain = len;
-            pt->fmt = fmt;
-            pt->wr = pt->rd = 0;
-            pt->peak = 0;
-            __atomic_store_n(&pt->handle, handle, __ATOMIC_RELEASE);
-            final_printf("port capture %d : 0x%08x (%u trames, format %u)\n", i, handle, len, fmt);
-        }
-    }
+    register_port(handle, type, len, freq, fmt);
     return handle;
 }
 
 s32 sceAudioOutClose_hook(s32 handle) {
-    int i = find_port(handle);
-    if (i >= 0) {
-        if (g_master == i) g_master = -1;
-        g_ports[i].handle = -1;
-    }
+    unregister_port(handle);
     return sceAudioOutClose(handle);
 }
 
@@ -393,15 +404,31 @@ static void imports_init(void) {
 // Cherche dans les segments de données de chaque module chargé (sauf le nôtre et
 // libSceAudioOut) les pointeurs vers les vraies fonctions et les remplace par nos
 // fonctions. Rappelée plusieurs fois : un module chargé plus tard est aussi traité.
+// Diagnostic (journal) : tous les modules vus par sceKernelGetModuleList. RE4 Remake ouvre un
+// seul port sceAudioOut, muet, et son son sort pourtant sur la TV : il passe par un autre chemin.
+// Une première version ne gardait que les noms « audio » et n'en a trouvé aucun, pas même
+// libSceAudioOut : la liste ne semble pas contenir les bibliothèques système.
+static char g_audio_modules[1024];
+static volatile u32 g_n_modules;
+
+static void note_audio_module(const char *name) {
+    if (!name[0] || strstr(g_audio_modules, name)) return;
+    size_t l = strlen(g_audio_modules);
+    snprintf(g_audio_modules + l, sizeof(g_audio_modules) - l, "%s%s", l ? " " : "", name);
+}
+
 static void replace_pointers(void **from, void **to, int count_patches) {
     static OrbisKernelModule mods[1024];
     size_t n = 0;
     if (sceKernelGetModuleList(mods, sizeof(mods) / sizeof(mods[0]), &n) != 0) return;
+    if (count_patches) g_n_modules = (u32) n;
+    if (count_patches && n == 0) note_audio_module("(liste vide)");
     for (size_t m = 0; m < n && m < 1024; m++) {
         OrbisKernelModuleInfo info;
         memset(&info, 0, sizeof(info));
         info.size = sizeof(info);
         if (sceKernelGetModuleInfo(mods[m], &info) != 0) continue;
+        if (count_patches) note_audio_module(info.name);
         if (strstr(info.name, "a4f_bt") || strstr(info.name, "libSceAudioOut")) continue;
         int hits = 0;
         for (u32 sgi = 0; sgi < info.segmentCount && sgi < 4; sgi++) {
@@ -424,6 +451,170 @@ static void replace_pointers(void **from, void **to, int count_patches) {
         if (hits && count_patches && strlen(g_patched_modules) + strlen(info.name) + 2 < sizeof(g_patched_modules)) {
             strcat(g_patched_modules, info.name);
             strcat(g_patched_modules, " ");
+        }
+    }
+}
+
+// ---- Audio3d (RE4 Remake), v9a : recherche en lecture seule, rien n'est modifié
+// RE4 importe libSceAudio3d (sceAudio3dAudioOutOpen/Output/Close, sceAudio3dBedWrite, ports et
+// objets 3D) et n'envoie que du silence par sceAudioOut : son vrai son passe par Audio3d.
+// Pour intercepter ces fonctions sans import nouveau, on cherche le module déjà chargé par le
+// jeu en interrogeant les numéros de module un par un (sceKernelGetModuleInfo, déjà utilisé),
+// puis l'adresse des fonctions avec sceKernelDlsym (déjà utilisé pour libSceUsbd).
+static const char *const a3d_names[] = {
+    "sceAudio3dAudioOutOpen", "sceAudio3dAudioOutOutput", "sceAudio3dAudioOutClose", "sceAudio3dBedWrite",
+    "sceAudio3dPortOpen", "sceAudio3dPortPush", "sceAudio3dPortAdvance", "sceAudio3dObjectReserve" };
+#define A3D_N (sizeof(a3d_names) / sizeof(a3d_names[0]))
+static void *g_a3d_real[A3D_N];
+static volatile s32 g_a3d_handle = -1;
+static volatile u32 g_a3d_found, g_a3d_refs[A3D_N];   // fonctions trouvées ; références dans le jeu
+static volatile u32 g_n_sys_modules;
+static char g_sys_modules[1536];   // noms des modules trouvés par numéro (journal)
+
+static void scan_audio3d(void) {
+    // repris à zéro à chaque passage : le module peut apparaître après le démarrage du jeu
+    g_n_sys_modules = 0;
+    g_sys_modules[0] = '\0';
+    for (OrbisKernelModule h = 0; h < 2048; h++) {
+        OrbisKernelModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(h, &info) != 0 || !info.name[0]) continue;
+        g_n_sys_modules++;
+        size_t l = strlen(g_sys_modules);
+        snprintf(g_sys_modules + l, sizeof(g_sys_modules) - l, "%s%s", l ? " " : "", info.name);
+        if (g_a3d_handle < 0 && strstr(info.name, "libSceAudio3d")) g_a3d_handle = (s32) h;
+    }
+    if (g_a3d_handle < 0) return;
+    for (size_t f = 0; f < A3D_N; f++)
+        if (sceKernelDlsym(g_a3d_handle, a3d_names[f], &g_a3d_real[f]) == 0 && g_a3d_real[f]) g_a3d_found++;
+    // combien de fois chaque adresse figure dans les données des modules du jeu (table d'imports)
+    static OrbisKernelModule mods[1024];
+    size_t n = 0;
+    if (sceKernelGetModuleList(mods, sizeof(mods) / sizeof(mods[0]), &n) != 0) return;
+    for (size_t m = 0; m < n && m < 1024; m++) {
+        OrbisKernelModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(mods[m], &info) != 0) continue;
+        if (strstr(info.name, "a4f_bt")) continue;
+        for (u32 sgi = 0; sgi < info.segmentCount && sgi < 4; sgi++) {
+            OrbisKernelModuleSegmentInfo *sg = &info.segmentInfo[sgi];
+            if ((sg->prot & 4) || !(sg->prot & 1)) continue;   // données lisibles, pas le code
+            const uint64_t *w = (const uint64_t *) sg->address;
+            for (u32 i = 0; i < sg->size / 8; i++)
+                for (size_t f = 0; f < A3D_N; f++)
+                    if (g_a3d_real[f] && w[i] == (uint64_t) g_a3d_real[f]) g_a3d_refs[f]++;
+        }
+    }
+}
+
+// ---- Audio3d : redirections. Chaque fonction appelle la vraie avec les mêmes paramètres (tous
+// entiers ou pointeurs, 7 au plus : rien ne se perd) et compte l'appel pour le journal.
+// v9b (comptage) dans RE4 : sceAudio3dAudioOutOutput ~98 appels/s, port MAIN 7.1 float de 512
+// trames ouvert par sceAudio3dAudioOutOpen = le mix principal du jeu. v9c : ce port est capturé
+// comme un port sceAudioOut (mixage, TV muette), s'il a été vu à l'ouverture (format connu ;
+// jamais deviné, un mauvais format ferait du bruit fort). BedWrite : 0 appel. L'ordre suit a3d_names.
+enum { A3D_AO_OPEN, A3D_AO_OUTPUT, A3D_AO_CLOSE, A3D_BED_WRITE, A3D_PORT_OPEN, A3D_PORT_PUSH,
+       A3D_PORT_ADVANCE, A3D_OBJECT_RESERVE };
+
+typedef s32 (*a3d_ao_open_t)(u32 port, s32 user, s32 type, s32 index, u32 len, u32 freq, u32 param);
+typedef s32 (*a3d_ao_output_t)(s32 handle, const void *ptr);
+typedef s32 (*a3d_ao_close_t)(s32 handle);
+typedef s32 (*a3d_bed_write_t)(u32 port, u32 channels, u32 format, const void *buf, u32 samples);
+typedef s32 (*a3d_port_open_t)(s32 user, const void *params, u32 *port);
+typedef s32 (*a3d_port_push_t)(u32 port, u32 blocking);
+typedef s32 (*a3d_port_advance_t)(u32 port);
+typedef s32 (*a3d_object_reserve_t)(u32 port, u32 *object);
+
+static volatile u32 g_a3d_calls[A3D_N], g_a3d_patched[A3D_N];
+static volatile s32 g_a3d_ao[5];     // dernier sceAudio3dAudioOutOpen : type, len, freq, format, handle
+static volatile u32 g_a3d_bed[3];    // dernier sceAudio3dBedWrite : canaux, format, échantillons
+static volatile u32 g_a3d_port[3];   // dernier sceAudio3dPortOpen : granularité, fréquence, objets max
+
+static s32 a3d_ao_open_hook(u32 port, s32 user, s32 type, s32 index, u32 len, u32 freq, u32 param) {
+    s32 h = ((a3d_ao_open_t) g_a3d_real[A3D_AO_OPEN])(port, user, type, index, len, freq, param);
+    g_a3d_ao[0] = type; g_a3d_ao[1] = (s32) len; g_a3d_ao[2] = (s32) freq; g_a3d_ao[3] = (s32) (param & 0xFF); g_a3d_ao[4] = h;
+    g_a3d_calls[A3D_AO_OPEN]++;
+    register_port(h, type, len, freq, param & 0xFF);
+    return h;
+}
+
+static s32 a3d_ao_output_hook(s32 handle, const void *ptr) {
+    g_a3d_calls[A3D_AO_OUTPUT]++;
+    return ((a3d_ao_output_t) g_a3d_real[A3D_AO_OUTPUT])(handle, capture(handle, ptr));
+}
+
+static s32 a3d_ao_close_hook(s32 handle) {
+    g_a3d_calls[A3D_AO_CLOSE]++;
+    unregister_port(handle);
+    return ((a3d_ao_close_t) g_a3d_real[A3D_AO_CLOSE])(handle);
+}
+
+static s32 a3d_bed_write_hook(u32 port, u32 channels, u32 format, const void *buf, u32 samples) {
+    g_a3d_bed[0] = channels; g_a3d_bed[1] = format; g_a3d_bed[2] = samples;
+    g_a3d_calls[A3D_BED_WRITE]++;
+    return ((a3d_bed_write_t) g_a3d_real[A3D_BED_WRITE])(port, channels, format, buf, samples);
+}
+
+static s32 a3d_port_open_hook(s32 user, const void *params, u32 *port) {
+    if (params) {   // SceAudio3dOpenParameters : taille, granularité, fréquence, objets max…
+        const u32 *pp = (const u32 *) params;
+        g_a3d_port[0] = pp[2]; g_a3d_port[1] = pp[3]; g_a3d_port[2] = pp[4];
+    }
+    g_a3d_calls[A3D_PORT_OPEN]++;
+    return ((a3d_port_open_t) g_a3d_real[A3D_PORT_OPEN])(user, params, port);
+}
+
+static s32 a3d_port_push_hook(u32 port, u32 blocking) {
+    g_a3d_calls[A3D_PORT_PUSH]++;
+    return ((a3d_port_push_t) g_a3d_real[A3D_PORT_PUSH])(port, blocking);
+}
+
+static s32 a3d_port_advance_hook(u32 port) {
+    g_a3d_calls[A3D_PORT_ADVANCE]++;
+    return ((a3d_port_advance_t) g_a3d_real[A3D_PORT_ADVANCE])(port);
+}
+
+static s32 a3d_object_reserve_hook(u32 port, u32 *object) {
+    g_a3d_calls[A3D_OBJECT_RESERVE]++;
+    return ((a3d_object_reserve_t) g_a3d_real[A3D_OBJECT_RESERVE])(port, object);
+}
+
+static void *const g_a3d_hook[A3D_N] = {
+    (void *) a3d_ao_open_hook, (void *) a3d_ao_output_hook, (void *) a3d_ao_close_hook, (void *) a3d_bed_write_hook,
+    (void *) a3d_port_open_hook, (void *) a3d_port_push_hook, (void *) a3d_port_advance_hook,
+    (void *) a3d_object_reserve_hook };
+
+// Même redirection que replace_pointers, pour les fonctions Audio3d trouvées par scan_audio3d.
+static void replace_a3d_pointers(int to_hooks) {
+    static OrbisKernelModule mods[1024];
+    size_t n = 0;
+    if (g_a3d_found != A3D_N) return;   // toutes les fonctions ou aucune
+    if (sceKernelGetModuleList(mods, sizeof(mods) / sizeof(mods[0]), &n) != 0) return;
+    for (size_t m = 0; m < n && m < 1024; m++) {
+        OrbisKernelModuleInfo info;
+        memset(&info, 0, sizeof(info));
+        info.size = sizeof(info);
+        if (sceKernelGetModuleInfo(mods[m], &info) != 0) continue;
+        if (strstr(info.name, "a4f_bt")) continue;
+        for (u32 sgi = 0; sgi < info.segmentCount && sgi < 4; sgi++) {
+            OrbisKernelModuleSegmentInfo *sg = &info.segmentInfo[sgi];
+            if ((sg->prot & 4) || !(sg->prot & 1)) continue;   // données lisibles, pas le code
+            uint64_t *w = (uint64_t *) sg->address;
+            for (u32 i = 0; i < sg->size / 8; i++) {
+                for (size_t f = 0; f < A3D_N; f++) {
+                    void *from = to_hooks ? g_a3d_real[f] : g_a3d_hook[f];
+                    void *to = to_hooks ? g_a3d_hook[f] : g_a3d_real[f];
+                    if (w[i] != (uint64_t) from) continue;
+                    if (!(sg->prot & 2)) {
+                        void *page = (void *) ((uintptr_t) &w[i] & ~(uintptr_t) 0x3fff);
+                        if (sceKernelMprotect(page, 0x8000, sg->prot | 2) != 0) continue;
+                    }
+                    w[i] = (uint64_t) to;
+                    if (to_hooks) g_a3d_patched[f]++;
+                }
+            }
         }
     }
 }
@@ -494,9 +685,20 @@ static void read_volume(void) {
 
 static void *debug_thread(void *arg) {
     (void) arg;
-    FILE *f = fopen(DEBUG_PATH, "w");
+    // le journal du lancement précédent est gardé (une panne n'est plus effacée par la relance)
+    FILE *f = fopen(DEBUG_PATH, "r");
+    if (f) {
+        FILE *prev = fopen(DEBUG_PREV_PATH, "w");
+        static char chunk[4096];
+        size_t n;
+        while (prev && (n = fread(chunk, 1, sizeof(chunk), f)) > 0) fwrite(chunk, 1, n, prev);
+        if (prev) fclose(prev);
+        fclose(f);
+    }
+    f = fopen(DEBUG_PATH, "w");
     if (f) fclose(f);
     u32 logged_opens = 0;
+    char logged_audio_modules[sizeof(g_audio_modules)] = "";
     for (u32 t = 0;; t++) {
         // modules ou imports résolus après le démarrage : on repasse de temps en temps
         if (t < 30 || t % 10 == 0) patch_imports();
@@ -506,6 +708,28 @@ static void *debug_thread(void *arg) {
         a4f_bt_debug(bt, sizeof(bt));
         f = fopen(DEBUG_PATH, "a");
         if (f) {
+            static s32 logged_a3d = -2;   // journalisé une fois au début, puis quand le module apparaît
+            if (logged_a3d != g_a3d_handle && (t == 1 || g_a3d_handle >= 0)) {
+                logged_a3d = g_a3d_handle;
+                fprintf(f, "systeme (%u) : %s\n", g_n_sys_modules, g_sys_modules);
+                char refs[256] = "";
+                for (size_t k = 0; k < A3D_N; k++) {
+                    size_t l = strlen(refs);
+                    snprintf(refs + l, sizeof(refs) - l, " %s=%u", a3d_names[k] + 10, g_a3d_refs[k]);
+                }
+                // une seule écriture par ligne : fprintf(f, "\n") devenait fputc, import nouveau
+                char patched[64] = "";
+                for (size_t k = 0; k < A3D_N; k++) {
+                    size_t l = strlen(patched);
+                    snprintf(patched + l, sizeof(patched) - l, "%s%u", k ? "/" : "", g_a3d_patched[k]);
+                }
+                fprintf(f, "audio3d module %d, fonctions %u/%u, references%s, rediriges %s\n", g_a3d_handle,
+                        g_a3d_found, (u32) A3D_N, refs, patched);
+            }
+            if (strcmp(logged_audio_modules, g_audio_modules) != 0) {
+                memcpy(logged_audio_modules, g_audio_modules, sizeof(logged_audio_modules));
+                fprintf(f, "modules (%u) : %s\n", g_n_modules, logged_audio_modules);
+            }
             while (logged_opens < g_n_open && logged_opens < 8) {
                 volatile s32 *e = g_open_log[logged_opens++];
                 fprintf(f, "sceAudioOutOpen type %d len %d freq %d fmt %d -> 0x%08x\n", e[0], e[1], e[2], e[3], (u32) e[4]);
@@ -521,6 +745,12 @@ static void *debug_thread(void *arg) {
                 snprintf(ports + l, sizeof(ports) - l, "%s%x%s:%u", l ? " " : "", (u32) pt->handle & 0xff,
                          g_master == i ? "M" : "", peak * 100 / 32767);
             }
+            if (g_a3d_found == A3D_N)   // appels Audio3d depuis le lancement (ordre de a3d_names)
+                fprintf(f, "%3us a3d %u/%u/%u/%u/%u/%u/%u/%u ao type %d len %d freq %d fmt %d -> 0x%08x bed ch %u fmt %u n %u port gran %u freq %u obj %u\n",
+                        t, g_a3d_calls[0], g_a3d_calls[1], g_a3d_calls[2], g_a3d_calls[3], g_a3d_calls[4],
+                        g_a3d_calls[5], g_a3d_calls[6], g_a3d_calls[7], g_a3d_ao[0], g_a3d_ao[1], g_a3d_ao[2],
+                        g_a3d_ao[3], (u32) g_a3d_ao[4], g_a3d_bed[0], g_a3d_bed[1], g_a3d_bed[2], g_a3d_port[0],
+                        g_a3d_port[1], g_a3d_port[2]);
             fprintf(f, "%3us open %u output %u outputs %u captures %u ports [%s] relais %u jeu %s sfo %d/%d %d/%d usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
                     t, g_n_open, g_n_output, g_n_outputs, g_n_captured, ports, g_n_promoted, g_titleid, g_sfo_read[0], g_sfo_parse[0], g_sfo_read[1], g_sfo_parse[1], g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
                     g_patched[0], g_patched[1], g_patched[2], g_patched[3], g_patched_modules, bt);
@@ -619,6 +849,18 @@ static void *start_thread(void *arg) {
     OrbisPthread th, dbg;
     scePthreadCreate(&dbg, NULL, debug_thread, NULL, "a4f_bt_dbg");
     scePthreadCreate(&th, NULL, bt_thread, NULL, "a4f_bt");
+    // Audio3d (RE4) : chargé quelques secondes après le démarrage (introuvable au lancement en
+    // v9b, trouvé à 3 s en v9a). Recherche toutes les 100 ms pendant 15 s pour rediriger ses
+    // fonctions avant que le jeu ouvre son port, puis abandon (jeu sans Audio3d).
+    for (int k = 0; k < 150 && g_a3d_handle < 0; k++) {
+        scan_audio3d();
+        if (g_a3d_handle >= 0) {
+            replace_a3d_pointers(1);
+            break;
+        }
+        struct timespec pause = { 0, 100 * 1000 * 1000 };
+        nanosleep(&pause, NULL);
+    }
     // diagnostic seulement : la lecture réussit-elle un peu plus tard (trop tôt au démarrage ?)
     if (g_titleid[0] == '?') {
         sceKernelSleep(1);
@@ -640,6 +882,7 @@ s32 attr_public plugin_load(s32 argc, const char *argv[]) {
 s32 attr_public plugin_unload(s32 argc, const char *argv[]) {
     final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
     if (!g_active) return 0;   // processus ignoré au chargement
+    replace_a3d_pointers(0);
     unpatch_imports();
     a4f_bt_stop();
     return 0;
