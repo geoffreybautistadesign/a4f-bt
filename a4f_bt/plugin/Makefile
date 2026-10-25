@@ -21,7 +21,7 @@ LDFLAGS := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x -e _init --eh-frame-h
 	-L$(TOOLCHAIN)/lib -L$(GH_SDK) -lSceLibcInternal -lGoldHEN_Hook -lkernel -lSceSysmodule -lSceAudioOut
 
 OBJS := $(patsubst %.c,$(OUT)/bt/%.o,$(BTSTACK_SRC)) $(patsubst %.c,$(OUT)/a4f/%.o,$(A4F_BT_SRC)) \
-	$(OUT)/a4f/plugin/source/main.o $(OUT)/a4f/plugin/source/convert.o $(OUT)/plugin_common.o
+	$(OUT)/a4f/plugin/source/main.o $(OUT)/a4f/plugin/source/convert.o $(OUT)/a4f/plugin/source/title.o $(OUT)/plugin_common.o
 
 a4f_bt.prx: $(OBJS)
 	$(LD) $(GH_SDK)/build/crtprx.o $(OBJS) -o $(OUT)/a4f_bt.elf $(LDFLAGS)

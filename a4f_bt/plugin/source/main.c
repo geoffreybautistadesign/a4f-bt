@@ -11,11 +11,12 @@
 
 #include "a4f_bt.h"
 #include "a4f_convert.h"
+#include "a4f_title.h"
 
 attr_public const char *g_pluginName = "a4f_bt";
 attr_public const char *g_pluginDesc = "Son du jeu vers des AirPods par un dongle Bluetooth USB";
 attr_public const char *g_pluginAuth = "geoffrey";
-attr_public u32 g_pluginVersion = 0x00000800; // 8.00 (mixage de tous les ports MAIN)
+attr_public u32 g_pluginVersion = 0x00000805; // 8.05 (diagnostic param.sfo, délai de garde 12 s)
 
 #define DATA_DIR  GOLDHEN_PATH "/a4f_bt/"
 #define DUMP_PATH GOLDHEN_PATH "/a4f_bt/hci.pklg"
@@ -227,6 +228,10 @@ static volatile int g_push_lock;      // un seul thread pousse vers le Bluetooth
 // compteurs pour le journal de debug (écrits par le thread audio du jeu, lus par le journal)
 static volatile u32 g_n_open, g_n_output, g_n_outputs, g_n_captured, g_n_promoted;
 static volatile s32 g_open_log[8][5];   // type, len, freq, fmt, handle des premiers sceAudioOutOpen
+static char g_titleid[16] = "?";   // pour le journal : '?' = param.sfo illisible, plugin actif quand même
+// Diagnostic de la lecture (journal) : octets lus, ou -errno si fopen a échoué ; puis 0/-1
+// pour le décodage. v8d : 'jeu ?' dans Rayman, sans savoir quelle étape échouait.
+static volatile s32 g_sfo_read[2] = { -9999, -9999 }, g_sfo_parse[2] = { -9, -9 };
 
 // TV : par défaut on envoie du silence au vrai sceAudioOut pour les ports capturés, mais
 // seulement pendant que les AirPods jouent (si le Bluetooth décroche, la TV reprend).
@@ -516,8 +521,8 @@ static void *debug_thread(void *arg) {
                 snprintf(ports + l, sizeof(ports) - l, "%s%x%s:%u", l ? " " : "", (u32) pt->handle & 0xff,
                          g_master == i ? "M" : "", peak * 100 / 32767);
             }
-            fprintf(f, "%3us open %u output %u outputs %u captures %u ports [%s] relais %u usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
-                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, ports, g_n_promoted, g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
+            fprintf(f, "%3us open %u output %u outputs %u captures %u ports [%s] relais %u jeu %s sfo %d/%d %d/%d usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
+                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, ports, g_n_promoted, g_titleid, g_sfo_read[0], g_sfo_parse[0], g_sfo_read[1], g_sfo_parse[1], g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
                     g_patched[0], g_patched[1], g_patched[2], g_patched[3], g_patched_modules, bt);
             fclose(f);
         }
@@ -551,20 +556,90 @@ static void *bt_thread(void *arg) {
     return NULL;
 }
 
-s32 attr_public plugin_load(s32 argc, const char *argv[]) {
-    final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
-    for (int i = 0; i < MAX_PORTS; i++) g_ports[i].handle = -1;
-    // imports redirigés tout de suite : le jeu ouvre ses ports audio dès son démarrage
+// ---------------------------------------------------------------- processus visés
+// Sous [default], GoldHEN charge le plugin dans tous les processus : homebrews, menu de la PS4,
+// processus annexes des jeux. Un homebrew restait alors sur un chargement infini. Comme
+// xbox_controller_plugin (ChiricoG, MIT), on ne s'active que dans les jeux (identifiant CUSA,
+// PCAS ou PLAS). L'identifiant est lu dans /app0/sce_sys/param.sfo avec fopen/fread, déjà
+// utilisés partout : la v8c, qui le demandait au noyau GoldHEN (sys_sdk_proc_info), faisait
+// planter les jeux au chargement avec le GoldHEN de cette console (2.1b18.12).
+
+#define PARAM_SFO_PATH "/app0/sce_sys/param.sfo"
+
+// Jeux où le plugin reste inactif (identifiants CUSAxxxxx, liste terminée par NULL). Vide pour
+// l'instant : RE4 Remake (CUSA33387) s'est figé deux fois au lancement (v4, v7b), à retester.
+static const char *const excluded_titles[] = { NULL };
+
+static volatile int g_loaded;   // plugin_load une seule fois par processus
+static volatile int g_active;   // 0 : processus ignoré, rien n'a été touché
+
+
+// 0 si l'identifiant a été lu, -1 sinon (pas de param.sfo : on reste actif, comme avant v8d).
+static int read_title_id(char out[16], int attempt) {
+    static uint8_t sfo[16384];
+    FILE *f = fopen(PARAM_SFO_PATH, "rb");
+    if (!f) {
+        g_sfo_read[attempt] = -*__error();
+        return -1;
+    }
+    size_t n = fread(sfo, 1, sizeof(sfo), f);
+    fclose(f);
+    g_sfo_read[attempt] = (s32) n;
+    int r = a4f_sfo_title_id(sfo, n, out);
+    g_sfo_parse[attempt] = r;
+    return r;
+}
+
+static int is_excluded(const char *title_id) {
+    for (size_t i = 0; excluded_titles[i]; i++)
+        if (memcmp(title_id, excluded_titles[i], 9) == 0) return 1;
+    return 0;
+}
+
+// Tout le démarrage se fait dans ce thread et non dans plugin_load, qui ne fait que créer le
+// thread (comme la v8b, qui tournait sans souci). Trois versions qui faisaient plus dans
+// plugin_load (v7c et un plugin vide : fopen + sceKernelGetProcessTime ; v8c : sys_sdk_proc_info)
+// plantaient le jeu au chargement. La lecture de param.sfo se fait donc ici, avec fopen comme
+// le thread du journal. Les jeux n'ouvrent leurs ports audio qu'environ une seconde après le
+// démarrage : les imports sont redirigés bien avant.
+static void *start_thread(void *arg) {
+    (void) arg;
+    char title_id[16];
+    if (read_title_id(title_id, 0) == 0) {
+        if (!a4f_is_game_title(title_id)) return NULL;   // homebrew, appli système : rien
+        if (is_excluded(title_id)) {
+            Notify(TEX_ICON_SYSTEM, "A4F BT\nDesactive dans ce jeu");
+            return NULL;
+        }
+        memcpy(g_titleid, title_id, sizeof(g_titleid));
+    }
+    g_active = 1;
     imports_init();
     patch_imports();
     OrbisPthread th, dbg;
     scePthreadCreate(&dbg, NULL, debug_thread, NULL, "a4f_bt_dbg");
     scePthreadCreate(&th, NULL, bt_thread, NULL, "a4f_bt");
+    // diagnostic seulement : la lecture réussit-elle un peu plus tard (trop tôt au démarrage ?)
+    if (g_titleid[0] == '?') {
+        sceKernelSleep(1);
+        char later[16];
+        if (read_title_id(later, 1) == 0) memcpy(g_titleid, later, sizeof(g_titleid));
+    }
+    return NULL;
+}
+
+s32 attr_public plugin_load(s32 argc, const char *argv[]) {
+    final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
+    if (__atomic_exchange_n(&g_loaded, 1, __ATOMIC_ACQUIRE)) return 0;
+    for (int i = 0; i < MAX_PORTS; i++) g_ports[i].handle = -1;
+    OrbisPthread st;
+    scePthreadCreate(&st, NULL, start_thread, NULL, "a4f_bt_start");
     return 0;
 }
 
 s32 attr_public plugin_unload(s32 argc, const char *argv[]) {
     final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
+    if (!g_active) return 0;   // processus ignoré au chargement
     unpatch_imports();
     a4f_bt_stop();
     return 0;

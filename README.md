@@ -50,11 +50,18 @@ in the AirPods sometimes stops while the plugin keeps sending (see below).**
 - **Importing `sceKernelGetProcessTime` (or `scePthreadSelf`) crashes the game when the plugin is
   loaded**, before `plugin_load` runs (CE-34878-0) — a diagnostic build and an empty control plugin
   did. Before adding a libkernel import, compare `nm -u` with a known-good build.
+- `sys_sdk_proc_info` (GoldHEN SDK, process info) crashed the game at load with the GoldHEN of the
+  test console (shown as 2.1b18.12; the xbox_controller_plugin README asks for 2.3+).
+- Startup work now happens in a thread: `plugin_load` only creates it, like the last builds that
+  never crashed at load.
+- The dongle once never answered a Create Connection (no Connection Complete, no page timeout)
+  after a previous game had been closed; the 12 s watchdog restarts the Bluetooth stack, which
+  fixed it.
 - When a game is closed, the plugin dies without hanging up and the AirPods call the dongle back by
   themselves. Their connection request reached the next game's BTstack during initialisation, stayed
   pending after the dongle reset (Accept Connection → `0x02`) and blocked our own connection forever.
   The plugin now rejects incoming connections (it always calls the headset) and restarts the
-  Bluetooth stack if a connection is not established within 20 s.
+  Bluetooth stack if a connection is not established within 12 s.
 
 ---
 
@@ -62,7 +69,7 @@ in the AirPods sometimes stops while the plugin keeps sending (see below).**
 
 | Game | Audio capture | `libSceUsbd` | AirPods | Notes |
 |---|---|---|---|---|
-| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | tested with v7 (first MAIN port only); to retest with the v8 mix |
+| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ with the v8 mix | the sound is on the second MAIN port; the first one stays silent |
 | inFamous Second Son | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ✅ after leaving the sandbox | ✅ complete audio, TV muted | |
 | Ratchet & Clank | ✅ 1 MAIN 7.1 float port + BGM port | ✅ | ✅ complete audio (menu and game) | the BGM port (system background music) is not captured |
 | Shadow of the Colossus | ✅ 2 MAIN 7.1 float ports + BGM + pad speaker | ✅ after leaving the sandbox | ✅ with v8 | the game switches ports at a cutscene: v7 lost the sound there |
@@ -90,13 +97,27 @@ every second while the game runs):
 
 ## What is left to do
 
-1. **Sound stopping in the AirPods while the plugin keeps streaming** (Shadow of the Colossus,
-   once after taking one AirPod out, once without touching anything): the logs show 48 packets/s
-   going out and no pause request from the AirPods; the link was later lost (disconnect reason
-   `0x08`, connection timeout). Not understood yet.
-2. Test more games and fill in the table above.
-3. Volume control from the controller or from the AirPods (AVRCP absolute volume), instead of the
-   `volume` file.
+1. **Sound stopping in the AirPods.** The HCI logs show it comes from the radio side, not the
+   PS4: the AirPods take 170–390 ms to acknowledge packets (the dongle's 10 ACL buffers fill up
+   and sending stalls), and taking one AirPod out made them stop acknowledging altogether until
+   the link was lost (`0x08`). Things to try: a USB extension cable so the dongle is away from the
+   console's own 2.4 GHz radios, disabling automatic switching to a nearby iPhone, and detecting a
+   dead link within ~3 s instead of waiting for the supervision timeout.
+2. Test more games and fill in the table above (RE4 Remake to retest with the v8c sandbox
+   fallback; streaming apps such as Netflix or YouTube have CUSA title IDs and should work too).
+3. **Sound everywhere: move Bluetooth into SceShellUI.** Run BTstack once per boot in the PS4 menu
+   process instead of in every game, and keep only a light capture in each game/app that sends its
+   PCM to SceShellUI over the console's loopback network (a file is too slow for audio). Expected
+   gains: AirPods stay connected across games (no reconnection, no call-back race at launch), USB
+   no longer depends on each game's sandbox, and the menu sounds reach the AirPods too.
+   [xbox_controller_plugin](https://github.com/ChiricoG/xbox_controller_plugin) (MIT) shows a
+   GoldHEN plugin running in SceShellUI and talking to the game process.
+4. **In-game menu from the controller** (button combo, `scePadRead` redirected like the audio
+   imports): volume, TV on/off, choose/connect/disconnect paired devices, pair a new one, AirPods
+   listening modes (noise cancellation/transparency over Apple's AAP protocol) and battery level.
+   Fits naturally in the SceShellUI version.
+5. Volume control from the AirPods themselves (AVRCP absolute volume), instead of the `volume`
+   file.
 
 How the capture works: `sceAudioOutOpen`, `sceAudioOutClose`, `sceAudioOutOutput` and
 `sceAudioOutOutputs` are redirected in the import tables (GOT) of the game modules, so
@@ -149,10 +170,22 @@ make -f a4f_bt/mac/Makefile BTSTACK=/tmp/btstack A4F_BT=$PWD/a4f_bt LIBUSB=<libu
 ## Installing on the PS4
 
 1. Copy `a4f_bt.prx` to `/data/GoldHEN/plugins/` (GoldHEN FTP, port 2121).
-2. Add to `/data/GoldHEN/plugins.ini`, `[default]` section:
-   `/data/GoldHEN/plugins/a4f_bt.prx=true`
+2. In `/data/GoldHEN/plugins.ini`, add one section per game (title ID, e.g. `CUSA00069`):
+
+   ```ini
+   [CUSA00069]
+   /data/GoldHEN/plugins/a4f_bt.prx=true
+   ```
+
+   Avoid `[default]`: GoldHEN then loads the plugin into homebrew apps too, and one of them stayed
+   on an endless loading screen. The plugin tries to skip non-game processes by reading
+   `/app0/sce_sys/param.sfo`, but on the test console that file is not visible from the plugin
+   (`ENOENT`, logged as `sfo -2/-9`), so it stays active everywhere it is loaded.
 3. Enable "Plugin Loader" in the GoldHEN settings.
 4. Dongle on the **right** USB port, AirPods in pairing mode the first time, launch a game.
+
+Some homebrew tools rewrite `plugins.ini` at boot (on the test console, one put back an older copy,
+and even older `.prx` files): check it after each reboot.
 
 ## Licenses
 

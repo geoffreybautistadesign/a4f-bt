@@ -23,7 +23,9 @@
 #define AUDIO_TIMEOUT_MS     10
 #define SBC_STORAGE_SIZE     1030
 #define RETRY_MS             4000
-#define CONNECT_TIMEOUT_MS   20000  // connexion pas aboutie : on redémarre le Bluetooth
+// Connexion pas aboutie : on redémarre le Bluetooth. Le dongle répond en 5 s au plus (page
+// timeout) ; il est déjà resté muet 20 s après « Create Connection » (Rayman, v8d).
+#define CONNECT_TIMEOUT_MS   12000
 #define INQUIRY_1280MS_UNITS 8      // ~10 s de recherche
 #define COD_AUDIO_HEADSET    (0x200000 | 0x000400)   // service Audio + classe majeure Audio/Video
 
