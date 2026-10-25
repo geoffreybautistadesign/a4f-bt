@@ -23,6 +23,7 @@
 #define AUDIO_TIMEOUT_MS     10
 #define SBC_STORAGE_SIZE     1030
 #define RETRY_MS             4000
+#define CONNECT_TIMEOUT_MS   20000  // connexion pas aboutie : on redémarre le Bluetooth
 #define INQUIRY_1280MS_UNITS 8      // ~10 s de recherche
 #define COD_AUDIO_HEADSET    (0x200000 | 0x000400)   // service Audio + classe majeure Audio/Video
 
@@ -37,6 +38,9 @@ static bd_addr_t   device_addr;
 static bool        have_device;     // dernier casque connu (clé d'appairage en mémoire)
 static unsigned    attempt;
 static btstack_timer_source_t retry_timer;
+static btstack_timer_source_t watchdog_timer;
+static btstack_timer_source_t power_on_timer;
+static bool        restart_pending;  // extinction demandée par le délai de garde, rallumer ensuite
 static btstack_packet_callback_registration_t hci_event_registration;
 
 static const btstack_tlv_t *tlv_impl;
@@ -201,9 +205,41 @@ static void audio_stop(void){
 
 static void schedule_retry(uint32_t ms);
 
+// Connexions entrantes toujours refusées : c'est le plugin qui appelle le casque. Quand un jeu
+// est fermé, le plugin meurt sans raccrocher et les AirPods rappellent le dongle tout seuls ;
+// leur demande arrivait pendant l'initialisation du jeu suivant, BTstack la gardait en attente
+// après le reset du dongle (« Accept Connection » refusé, 0x02) et notre propre connexion
+// attendait cette connexion fantôme indéfiniment (Shadow of the Colossus, v8).
+static int accept_incoming(bd_addr_t addr, hci_link_type_t link_type){
+    (void) addr;
+    (void) link_type;
+    return 0;
+}
+
+static void power_on_handler(btstack_timer_source_t *timer){
+    (void) timer;
+    if (hci_power_control(HCI_POWER_ON) != 0) status("Dongle Bluetooth introuvable");
+}
+
+// Délai de garde : une connexion qui n'aboutit pas (ni réussite ni échec) bloquait tout.
+// Éteindre le Bluetooth libère toutes les connexions ; on le rallume à l'événement OFF.
+static void watchdog_handler(btstack_timer_source_t *timer){
+    (void) timer;
+    if (state != ST_CONNECTING) return;
+    status("Connexion bloquee, redemarrage du Bluetooth");
+    state = ST_OFF;
+    restart_pending = true;
+    btstack_run_loop_remove_timer(&retry_timer);
+    hci_power_control(HCI_POWER_OFF);
+}
+
 static void connect_to(const bd_addr_t addr){
     memcpy(device_addr, addr, 6);
     state = ST_CONNECTING;
+    btstack_run_loop_remove_timer(&watchdog_timer);
+    btstack_run_loop_set_timer_handler(&watchdog_timer, watchdog_handler);
+    btstack_run_loop_set_timer(&watchdog_timer, CONNECT_TIMEOUT_MS);
+    btstack_run_loop_add_timer(&watchdog_timer);
     uint8_t r = a2dp_source_establish_stream(device_addr, &media.a2dp_cid);
     if (r != ERROR_CODE_SUCCESS){
         printf("A4F BT: connexion refusee tout de suite (0x%02x)\n", r);
@@ -253,7 +289,15 @@ static void hci_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
 
     switch (hci_event_packet_get_type(packet)){
         case BTSTACK_EVENT_STATE:
+            if (btstack_event_state_get_state(packet) == HCI_STATE_OFF && restart_pending){
+                restart_pending = false;
+                btstack_run_loop_remove_timer(&power_on_timer);
+                btstack_run_loop_set_timer_handler(&power_on_timer, power_on_handler);
+                btstack_run_loop_set_timer(&power_on_timer, 500);
+                btstack_run_loop_add_timer(&power_on_timer);
+            }
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING){
+                if (tlv_impl) btstack_tlv_posix_deinit(&tlv_context);   // redémarrage par le délai de garde
                 setup_storage();
                 status("Dongle Bluetooth pret");
                 state = ST_IDLE;
@@ -307,6 +351,7 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             if (st != ERROR_CODE_SUCCESS){
                 printf("A4F BT: connexion echouee (0x%02x)\n", st);
                 media.a2dp_cid = 0;
+                if (restart_pending) break;   // extinction en cours : le rallumage relancera tout
                 state = ST_IDLE;
                 schedule_retry(RETRY_MS);
                 break;
@@ -350,6 +395,7 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             media.local_seid = a2dp_subevent_stream_established_get_local_seid(packet);
             media.stream_opened = 1;
             state = ST_CONNECTED;
+            btstack_run_loop_remove_timer(&watchdog_timer);
             status("Connecte a %s (%d Hz)", bd_addr_to_str(addr), sample_rate);
             a2dp_source_start_stream(media.a2dp_cid, media.local_seid);
             break;
@@ -380,6 +426,7 @@ static void a2dp_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *
             if (a2dp_subevent_signaling_connection_released_get_a2dp_cid(packet) != media.a2dp_cid) break;
             media.a2dp_cid = 0;
             audio_stop();
+            if (restart_pending) break;   // extinction voulue par le délai de garde
             status("Casque deconnecte");
             state = ST_IDLE;
             schedule_retry(RETRY_MS);
@@ -409,6 +456,7 @@ int a4f_bt_run(const a4f_bt_config_t *config){
     hci_init(hci_transport_a4f_usb_instance(), NULL);
 
     hci_set_master_slave_policy(0);
+    gap_register_classic_connection_filter(&accept_incoming);
     hci_set_inquiry_mode(INQUIRY_MODE_RSSI_AND_EIR);
     l2cap_init();
     a2dp_source_init();

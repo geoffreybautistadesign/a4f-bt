@@ -3,9 +3,10 @@
 Goal: on a jailbroken PS4 Pro (GoldHEN, firmware 13.52), send game audio straight to AirPods
 through a USB Bluetooth dongle plugged into the console — **no phone, no computer**.
 
-**Status: game audio plays in the AirPods in real time (Rayman, inFamous Second Son: ~48 A2DP
-packets/s, no drops, no underruns, ~40 ms buffer), with an adjustable volume and the TV muted
-while the AirPods play. Only one audio port is captured so far.**
+**Status: game audio plays in the AirPods in real time (Rayman, inFamous Second Son, Ratchet &
+Clank, Shadow of the Colossus: ~48 A2DP packets/s, ~40 ms buffer), with an adjustable volume and
+the TV muted while the AirPods play. All MAIN audio ports are mixed (v8). Open issue: the sound
+in the AirPods sometimes stops while the plugin keeps sending (see below).**
 
 ---
 
@@ -46,6 +47,14 @@ while the AirPods play. Only one audio port is captured so far.**
   long enough to load the module and goes back (`sys_sdk_unjailbreak`): staying outside changes the
   process root, the game no longer finds `/app0` and stays on a black screen.
 - `fscanf` did not read the settings files (musl headers + PS4 libc); they are parsed by hand.
+- **Importing `sceKernelGetProcessTime` (or `scePthreadSelf`) crashes the game when the plugin is
+  loaded**, before `plugin_load` runs (CE-34878-0) — a diagnostic build and an empty control plugin
+  did. Before adding a libkernel import, compare `nm -u` with a known-good build.
+- When a game is closed, the plugin dies without hanging up and the AirPods call the dongle back by
+  themselves. Their connection request reached the next game's BTstack during initialisation, stayed
+  pending after the dongle reset (Accept Connection → `0x02`) and blocked our own connection forever.
+  The plugin now rejects incoming connections (it always calls the headset) and restarts the
+  Bluetooth stack if a connection is not established within 20 s.
 
 ---
 
@@ -53,9 +62,16 @@ while the AirPods play. Only one audio port is captured so far.**
 
 | Game | Audio capture | `libSceUsbd` | AirPods | Notes |
 |---|---|---|---|---|
-| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | only the first MAIN port is captured; the others stay on the TV |
+| Rayman | ✅ 5 ports (2 MAIN float stereo, 1 MAIN s16, pad speaker) | ✅ | ✅ | tested with v7 (first MAIN port only); to retest with the v8 mix |
 | inFamous Second Son | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ✅ after leaving the sandbox | ✅ complete audio, TV muted | |
-| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ before v6 (`0x80020002`) | ? | to retest with the sandbox fallback |
+| Ratchet & Clank | ✅ 1 MAIN 7.1 float port + BGM port | ✅ | ✅ complete audio (menu and game) | the BGM port (system background music) is not captured |
+| Shadow of the Colossus | ✅ 2 MAIN 7.1 float ports + BGM + pad speaker | ✅ after leaving the sandbox | ✅ with v8 | the game switches ports at a cutscene: v7 lost the sound there |
+| Resident Evil 4 (remake) | ✅ 1 MAIN 7.1 float port, `sceAudioOutOutputs` | ❌ before v6 (`0x80020002`) | ❌ | froze at launch twice with the plugin: keep the plugin out of this game |
+
+`debug.log` (`/data/GoldHEN/a4f_bt/`) has one line per second: audio ports opened, captured blocks,
+captured ports with their peak level of the last second (`ports [7M:12 6:0]`: port `…07` is the
+master and peaks at 12 %), `usbd tries/step/error`, A2DP packets sent, dropped frames. Healthy
+numbers: `paquets` ~47/s, `jetees` not increasing.
 
 `debug.log` (`/data/GoldHEN/a4f_bt/`) has one line per second: audio ports opened, captured blocks,
 `usbd tries/step/error`, A2DP packets sent, dropped frames. Healthy numbers: `paquets` ~47/s,
@@ -74,8 +90,10 @@ every second while the game runs):
 
 ## What is left to do
 
-1. **Mix several audio ports**: games often open several `MAIN` ports (Rayman: two float stereo
-   ports plus an s16 port); the plugin only captures the first one, so some sounds may be missing.
+1. **Sound stopping in the AirPods while the plugin keeps streaming** (Shadow of the Colossus,
+   once after taking one AirPod out, once without touching anything): the logs show 48 packets/s
+   going out and no pause request from the AirPods; the link was later lost (disconnect reason
+   `0x08`, connection timeout). Not understood yet.
 2. Test more games and fill in the table above.
 3. Volume control from the controller or from the AirPods (AVRCP absolute volume), instead of the
    `volume` file.

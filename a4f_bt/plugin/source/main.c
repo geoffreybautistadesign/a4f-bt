@@ -15,7 +15,7 @@
 attr_public const char *g_pluginName = "a4f_bt";
 attr_public const char *g_pluginDesc = "Son du jeu vers des AirPods par un dongle Bluetooth USB";
 attr_public const char *g_pluginAuth = "geoffrey";
-attr_public u32 g_pluginVersion = 0x00000300; // 3.00
+attr_public u32 g_pluginVersion = 0x00000800; // 8.00 (mixage de tous les ports MAIN)
 
 #define DATA_DIR  GOLDHEN_PATH "/a4f_bt/"
 #define DUMP_PATH GOLDHEN_PATH "/a4f_bt/hci.pklg"
@@ -180,8 +180,12 @@ void __assert_fail(const char *expr, const char *file, int line, const char *fun
 // puis sceAudioOutOutput(s) pour copier chaque bloc, le convertir en s16 stéréo 48 kHz
 // et le pousser vers le Bluetooth. Le jeu appelle toujours la vraie fonction (son TV intact).
 //
-// Le tampon Bluetooth n'a qu'une entrée : on capture le port principal du jeu
-// (premier port MAIN ouvert). Mixer plusieurs ports viendra si un jeu en a besoin.
+// Tous les ports MAIN du jeu sont capturés et mélangés (v8) : beaucoup de jeux en ouvrent
+// plusieurs et basculent de l'un à l'autre (Shadow of the Colossus : son du jeu sur le second
+// port après une cinématique, AirPods muets). Un port « maître » rythme l'envoi : à chaque
+// bloc qu'il donne, on y ajoute ce que les autres ports ont mis dans leur petit tampon.
+// Si le maître ne se manifeste plus (tampon d'un autre port qui déborde), cet autre port
+// devient maître. Les ports BGM (musique de fond du système, Spotify) et manette sont ignorés.
 //
 // Interception par la table d'imports (GOT) des modules du jeu, pas par les détours
 // GoldHEN (HOOK32) : le détour recopie tel quel le début de sceAudioOutOutput dans son
@@ -204,26 +208,110 @@ s32 sceAudioOutOutput(s32 handle, const void *ptr);
 s32 sceAudioOutOutputs(AudioOutOutputParam *param, u32 num);
 
 
-static volatile s32 g_port = -1;      // port capturé
-static u32 g_port_grain, g_port_fmt;
-static int16_t g_pcm[MAX_GRAIN * 2];
+#define MAX_PORTS  4
+#define PORT_RING  4096   // trames par port (85 ms), puissance de 2
+
+typedef struct {
+    volatile s32 handle;          // -1 = libre
+    u32 grain, fmt;
+    int16_t pcm[MAX_GRAIN * 2];   // bloc converti en s16 stéréo (propre à chaque port : threads différents)
+    int16_t ring[PORT_RING * 2];  // ce que ce port a donné depuis le dernier bloc du maître
+    volatile u32 wr, rd;          // un écrivain (thread du port), un lecteur (thread du maître)
+    volatile u32 peak;            // crête de la dernière seconde, 0-32767 (journal)
+} port_t;
+
+static port_t g_ports[MAX_PORTS];
+static volatile s32 g_master = -1;    // index du port maître dans g_ports
+static volatile int g_push_lock;      // un seul thread pousse vers le Bluetooth à la fois
 
 // compteurs pour le journal de debug (écrits par le thread audio du jeu, lus par le journal)
-static volatile u32 g_n_open, g_n_output, g_n_outputs, g_n_captured;
+static volatile u32 g_n_open, g_n_output, g_n_outputs, g_n_captured, g_n_promoted;
 static volatile s32 g_open_log[8][5];   // type, len, freq, fmt, handle des premiers sceAudioOutOpen
 
-// TV : par défaut on envoie du silence au vrai sceAudioOut pour le port capturé, mais
+// TV : par défaut on envoie du silence au vrai sceAudioOut pour les ports capturés, mais
 // seulement pendant que les AirPods jouent (si le Bluetooth décroche, la TV reprend).
-// Les autres ports (haut-parleur de la manette, ports non capturés) restent intacts.
+// Les autres ports (haut-parleur de la manette, BGM) restent intacts.
 static volatile s32 g_tv_on;                        // fichier TV_PATH, relu chaque seconde
 static const u8 g_silence[MAX_GRAIN * 8 * 4];       // un bloc 7.1 float de la taille maximale
 
+static int find_port(s32 handle) {
+    for (int i = 0; i < MAX_PORTS; i++)
+        if (g_ports[i].handle == handle) return i;
+    return -1;
+}
+
+static void update_peak(port_t *pt, const int16_t *pcm, u32 frames) {
+    u32 peak = pt->peak;
+    for (u32 i = 0; i < frames * 2; i++) {
+        int v = pcm[i] < 0 ? -pcm[i] : pcm[i];
+        if ((u32) v > peak) peak = (u32) v;
+    }
+    pt->peak = peak;
+}
+
+// Port non maître : on garde son bloc pour le prochain bloc du maître (trames en trop jetées).
+static void ring_write(port_t *pt, const int16_t *pcm, u32 frames) {
+    u32 wr = __atomic_load_n(&pt->wr, __ATOMIC_RELAXED);
+    u32 rd = __atomic_load_n(&pt->rd, __ATOMIC_ACQUIRE);
+    u32 space = PORT_RING - (wr - rd);
+    if (frames > space) frames = space;
+    for (u32 i = 0; i < frames; i++) {
+        u32 k = (wr + i) & (PORT_RING - 1);
+        pt->ring[2 * k] = pcm[2 * i];
+        pt->ring[2 * k + 1] = pcm[2 * i + 1];
+    }
+    __atomic_store_n(&pt->wr, wr + frames, __ATOMIC_RELEASE);
+}
+
+static u32 ring_fill(port_t *pt) {
+    return __atomic_load_n(&pt->wr, __ATOMIC_ACQUIRE) - __atomic_load_n(&pt->rd, __ATOMIC_ACQUIRE);
+}
+
+// Maître : ajoute au bloc `mix` ce que le port `pt` a en attente (au plus `frames` trames).
+static void ring_mix(port_t *pt, int16_t *mix, u32 frames) {
+    u32 rd = __atomic_load_n(&pt->rd, __ATOMIC_RELAXED);
+    u32 n = ring_fill(pt);
+    if (n > frames) n = frames;
+    for (u32 i = 0; i < n; i++) {
+        u32 k = (rd + i) & (PORT_RING - 1);
+        for (int c = 0; c < 2; c++) {
+            int v = mix[2 * i + c] + pt->ring[2 * k + c];
+            mix[2 * i + c] = (int16_t) (v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+        }
+    }
+    __atomic_store_n(&pt->rd, rd + n, __ATOMIC_RELEASE);
+}
+
+static void push_mixed(int me) {
+    port_t *pt = &g_ports[me];
+    for (int i = 0; i < MAX_PORTS; i++)
+        if (i != me && g_ports[i].handle >= 0) ring_mix(&g_ports[i], pt->pcm, pt->grain);
+    while (__atomic_test_and_set(&g_push_lock, __ATOMIC_ACQUIRE)) {}
+    a4f_bt_push_pcm(pt->pcm, pt->grain);
+    __atomic_clear(&g_push_lock, __ATOMIC_RELEASE);
+    g_n_captured++;
+}
+
 // Copie le bloc vers le Bluetooth ; renvoie le pointeur à passer au vrai sceAudioOut.
 static const void *capture(s32 handle, const void *ptr) {
-    if (handle != g_port || !ptr) return ptr;
-    if (a4f_to_s16_stereo(ptr, g_port_fmt, g_port_grain, g_pcm) == 0) {
-        a4f_bt_push_pcm(g_pcm, g_port_grain);
-        g_n_captured++;
+    if (!ptr) return ptr;
+    int me = find_port(handle);
+    if (me < 0) return ptr;
+    port_t *pt = &g_ports[me];
+    if (a4f_to_s16_stereo(ptr, pt->fmt, pt->grain, pt->pcm) == 0) {
+        update_peak(pt, pt->pcm, pt->grain);
+        if (g_master < 0) g_master = me;
+        if (g_master == me) {
+            push_mixed(me);
+        } else {
+            ring_write(pt, pt->pcm, pt->grain);
+            // le maître ne vide plus notre tampon (port muet ou plus appelé) : on prend le relais
+            if (ring_fill(pt) > 3 * pt->grain) {
+                __atomic_store_n(&pt->rd, __atomic_load_n(&pt->wr, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+                g_master = me;
+                g_n_promoted++;
+            }
+        }
     }
     return (!g_tv_on && a4f_bt_is_streaming()) ? (const void *) g_silence : ptr;
 }
@@ -237,18 +325,28 @@ s32 sceAudioOutOpen_hook(s32 userId, s32 type, s32 index, u32 len, u32 freq, u32
         e[0] = type; e[1] = (s32) len; e[2] = (s32) freq; e[3] = (s32) fmt; e[4] = handle;
     }
     g_n_open++;
-    if (handle >= 0 && g_port < 0 && type == SCE_AUDIO_OUT_PORT_TYPE_MAIN &&
-        freq == 48000 && len <= MAX_GRAIN && a4f_channels(fmt) != 0) {
-        g_port_grain = len;
-        g_port_fmt = fmt;
-        g_port = handle;
-        final_printf("port capture : 0x%08x (%u trames, format %u)\n", handle, len, fmt);
+    if (handle >= 0 && type == SCE_AUDIO_OUT_PORT_TYPE_MAIN && freq == 48000 &&
+        len <= MAX_GRAIN && a4f_channels(fmt) != 0 && find_port(handle) < 0) {
+        int i = find_port(-1);
+        if (i >= 0) {
+            port_t *pt = &g_ports[i];
+            pt->grain = len;
+            pt->fmt = fmt;
+            pt->wr = pt->rd = 0;
+            pt->peak = 0;
+            __atomic_store_n(&pt->handle, handle, __ATOMIC_RELEASE);
+            final_printf("port capture %d : 0x%08x (%u trames, format %u)\n", i, handle, len, fmt);
+        }
     }
     return handle;
 }
 
 s32 sceAudioOutClose_hook(s32 handle) {
-    if (handle == g_port) g_port = -1;
+    int i = find_port(handle);
+    if (i >= 0) {
+        if (g_master == i) g_master = -1;
+        g_ports[i].handle = -1;
+    }
     return sceAudioOutClose(handle);
 }
 
@@ -407,8 +505,19 @@ static void *debug_thread(void *arg) {
                 volatile s32 *e = g_open_log[logged_opens++];
                 fprintf(f, "sceAudioOutOpen type %d len %d freq %d fmt %d -> 0x%08x\n", e[0], e[1], e[2], e[3], (u32) e[4]);
             }
-            fprintf(f, "%3us open %u output %u outputs %u captures %u port 0x%08x usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
-                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, (u32) g_port, g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
+            // ports capturés : 'M' = maître, crête de la dernière seconde en %
+            char ports[96] = "";
+            for (int i = 0; i < MAX_PORTS; i++) {
+                port_t *pt = &g_ports[i];
+                if (pt->handle < 0) continue;
+                u32 peak = pt->peak;
+                pt->peak = 0;
+                size_t l = strlen(ports);
+                snprintf(ports + l, sizeof(ports) - l, "%s%x%s:%u", l ? " " : "", (u32) pt->handle & 0xff,
+                         g_master == i ? "M" : "", peak * 100 / 32767);
+            }
+            fprintf(f, "%3us open %u output %u outputs %u captures %u ports [%s] relais %u usbd %d/%d/0x%x jb %d tv %d lu %d | imports %u/%u/%u/%u [%s] | %s\n",
+                    t, g_n_open, g_n_output, g_n_outputs, g_n_captured, ports, g_n_promoted, g_usbd_tries, g_usbd_step, (u32) g_usbd_err, g_jailbroken, (int) g_tv_on, g_last_read,
                     g_patched[0], g_patched[1], g_patched[2], g_patched[3], g_patched_modules, bt);
             fclose(f);
         }
@@ -444,6 +553,7 @@ static void *bt_thread(void *arg) {
 
 s32 attr_public plugin_load(s32 argc, const char *argv[]) {
     final_printf("[GoldHEN] <%s\\Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
+    for (int i = 0; i < MAX_PORTS; i++) g_ports[i].handle = -1;
     // imports redirigés tout de suite : le jeu ouvre ses ports audio dès son démarrage
     imports_init();
     patch_imports();
